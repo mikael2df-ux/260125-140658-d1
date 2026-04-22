@@ -1,0 +1,17 @@
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+.idea/
+.DS_Store
+
+# СЕКРЕТЫ
+src/secrets.h
+agent/agent.json
+agent/agent_qr.png
+agent/.venv/
+agent/__pycache__/
+
+# Локальные копии GyverLibs (справочники)
+FastBot2-main/
+CharDisplay-main/

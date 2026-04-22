@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Exec(rm)",
+      "Exec(pio)",
+      "Exec(~/.platformio/penv/Scripts/pio.exe run)",
+      "Exec(mkdir)",
+      "Exec(pip install)",
+      "Exec(python)",
+      "Exec(wc)",
+      "Exec(sleep)",
+      "Exec(curl)",
+      "Exec(~/.platformio/penv/Scripts/pio.exe device)"
+    ]
+  }
+}
