@@ -8,6 +8,7 @@
 #include "config.h"
 #include "secrets.h"
 #include <ESP8266WiFi.h>
+#include <ArduinoJson.h>
 #include <CharPlot.h>
 
 static FastBot2* _bot = nullptr;
@@ -20,6 +21,7 @@ static FastBot2* _bot = nullptr;
 // =========================================================
 enum PendStage : uint8_t {
     PS_IDLE = 0,
+    PS_PARSE,        // распарсить rawPayload и добавить/обновить ПК
     PS_SEND_ADDED,   // отправить "✅ добавлен, проверяю..."
     PS_DO_CHECK,     // сделать ping+agent+итог
 };
@@ -28,7 +30,9 @@ struct PendingCheck {
     PendStage stage = PS_IDLE;
     int       idx;
     fb::ID    chatID;
-    String    name;
+    int64_t   userId;
+    String    rawPayload;   // используется в PS_PARSE
+    String    name;         // заполняется после парсинга
     bool      isNew;
     uint32_t  nextAt;
 };
@@ -433,6 +437,17 @@ static void doReset(fb::Update& u, int idx) {
     screenPcInfo(u, idx);
 }
 
+// Мини-бар прогресса для <pre>-блока. value 0..100
+static String progressBar(float value, int width = 10) {
+    if (isnan(value) || value < 0) value = 0;
+    if (value > 100) value = 100;
+    int filled = (int)((value / 100.0f) * width + 0.5f);
+    String s;
+    s.reserve(width);
+    for (int i = 0; i < width; i++) s += (i < filled) ? "▓" : "░";
+    return s;
+}
+
 // ---- Agent actions ----
 static void doAgentStatus(fb::Update& u, int idx) {
     if (idx < 0 || idx >= pcm.count()) return;
@@ -441,16 +456,64 @@ static void doAgentStatus(fb::Update& u, int idx) {
     AgentResult r = agentStatus(pc);
     logAction(queryUserId(u), "AGT-STATUS " + pc.name);
 
-    String t = "🤖 <b>Agent: " + pc.name + "</b>\n\n";
-    if (r.ok) {
-        t += "HTTP " + String(r.httpCode) + " ✅\n";
-        t += "<pre>" + r.body + "</pre>";
-    } else {
+    String t = "🤖 <b>" + pc.name + "</b> — Agent status\n\n";
+
+    if (!r.ok) {
         t += "❌ HTTP " + String(r.httpCode) + "\n";
-        t += "<i>" + (r.body.length() ? r.body : String("no reply")) + "</i>";
+        if (r.body.length()) t += "<i>" + r.body + "</i>\n";
+        else                 t += "<i>no reply</i>\n";
+        fb::InlineKeyboard kb;
+        kb.addButton("🔄", "ast_" + String(idx)).addButton("⬅ Назад", "info_" + String(idx));
+        editCurrent(u, t, &kb);
+        return;
     }
+
+    // Парсим JSON ответ агента
+    DynamicJsonDocument doc(512);
+    DeserializationError err = deserializeJson(doc, r.body);
+    if (err) {
+        t += "⚠ JSON err: " + String(err.c_str()) + "\n<pre>" + r.body + "</pre>";
+    } else {
+        const char* host  = doc["host"]  | "?";
+        const char* os    = doc["os"]    | "?";
+        const char* ipStr = doc["ip"]    | "?";
+        const char* ver   = doc["agent"] | "?";
+        uint32_t upSec    = doc["uptime"] | 0;
+        float cpu         = doc["cpu"].isNull() ? NAN : doc["cpu"].as<float>();
+        float ram         = doc["ram"].isNull() ? NAN : doc["ram"].as<float>();
+
+        // HTML-строки с информацией
+        t += "🖥 <b>Host:</b>   " + String(host)  + "\n";
+        t += "💻 <b>OS:</b>     " + String(os)    + "\n";
+        t += "🌐 <b>IP:</b>     <code>" + String(ipStr) + "</code>\n";
+        t += "⏱ <b>Uptime:</b> " + fmtUptime(upSec * 1000UL) + "\n";
+
+        // CPU / RAM с прогресс-барами (в <pre>-блоке для моноширного)
+        t += "\n<pre>";
+        if (!isnan(cpu)) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "CPU  %s %5.1f%%\n",
+                     progressBar(cpu).c_str(), cpu);
+            t += buf;
+        } else {
+            t += "CPU  n/a (psutil?)\n";
+        }
+        if (!isnan(ram)) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "RAM  %s %5.1f%%",
+                     progressBar(ram).c_str(), ram);
+            t += buf;
+        } else {
+            t += "RAM  n/a (psutil?)";
+        }
+        t += "</pre>\n";
+
+        t += "\n<i>agent v" + String(ver) + "</i>";
+    }
+
     fb::InlineKeyboard kb;
-    kb.addButton("🔄", "ast_" + String(idx)).addButton("⬅ Назад", "info_" + String(idx));
+    kb.addButton("🔄 Обновить", "ast_" + String(idx)).newRow();
+    kb.addButton("⬅ Назад", "info_" + String(idx));
     editCurrent(u, t, &kb);
 }
 
@@ -505,6 +568,7 @@ static void doGroupWake(fb::Update& u, int groupIdx) {
 
 void uiHandleQuery(fb::Update& u) {
     Text data = u.query().data();
+    Serial.printf("[Q] data='%s'\n", String(data).c_str());
 
     auto idxFromData = [&](int skip) -> int {
         return String(data).substring(skip).toInt();
@@ -610,15 +674,31 @@ static void cmdGroup(fb::Update& u, const String& text) {
 }
 
 // Парсинг QR-строки: WOLBOT|v1|NAME|MAC|BCAST|IP|PORT|TOKEN
-// Возвращает true если полностью обработано.
+// ВАЖНО: внутри callback FastBot2 стек уже сильно занят (на ESP8266 ~4KB total).
+// Здесь НИ парсинга, НИ LittleFS-работы — только копирование текста в pending.
+// Вся тяжёлая работа в uiTick() → case PS_PARSE.
 static bool tryHandleQRPayload(fb::Update& u, const String& text) {
     if (!text.startsWith(QR_PREFIX)) return false;
+    Serial.println(F("[QR] payload captured, deferring"));
 
-    fb::ID chatID = u.message().chat().id();
-    int64_t userId = (int64_t)u.message().from().id();
+    _pending.stage = PS_PARSE;
+    _pending.rawPayload = text;
+    _pending.chatID = u.message().chat().id();
+    _pending.userId = (int64_t)u.message().from().id();
+    _pending.nextAt = millis() + 100;
+    return true;
+}
 
-    // Разбираем по |
-    // После QR_PREFIX идут поля, разделённые |. Их 6.
+// Собственно парсинг и запись на диск — уже в user-loop контексте
+// со свежим стеком.
+static void doParseQR() {
+    Serial.println(F("[QR] parsing payload"));
+    String text = _pending.rawPayload;
+    fb::ID chatID = _pending.chatID;
+    int64_t userId = _pending.userId;
+
+    _pending.rawPayload = "";   // освободить раньше
+
     String rest = text.substring(strlen(QR_PREFIX));
     String fields[6];
     int cnt = 0, start = 0;
@@ -630,7 +710,8 @@ static bool tryHandleQRPayload(fb::Update& u, const String& text) {
     }
     if (cnt < 6) {
         sendHTML(chatID, "❌ Неверный формат QR (ожидалось 6 полей, получено " + String(cnt) + ")");
-        return true;
+        _pending.stage = PS_IDLE;
+        return;
     }
 
     String name  = fields[0];
@@ -642,21 +723,19 @@ static bool tryHandleQRPayload(fb::Update& u, const String& text) {
     token.trim();
 
     IPAddress bc, ip;
-    if (!bc.fromString(bcast)) { sendHTML(chatID, "❌ bcast: " + bcast); return true; }
-    if (!ip.fromString(ipStr)) { sendHTML(chatID, "❌ ip: " + ipStr);    return true; }
-    if (port <= 0 || port > 65535) { sendHTML(chatID, "❌ port"); return true; }
-    if (token.length() < 8) { sendHTML(chatID, "❌ слишком короткий token"); return true; }
+    if (!bc.fromString(bcast)) { sendHTML(chatID, "❌ bcast: " + bcast); _pending.stage = PS_IDLE; return; }
+    if (!ip.fromString(ipStr)) { sendHTML(chatID, "❌ ip: " + ipStr);    _pending.stage = PS_IDLE; return; }
+    if (port <= 0 || port > 65535) { sendHTML(chatID, "❌ port"); _pending.stage = PS_IDLE; return; }
+    if (token.length() < 8) { sendHTML(chatID, "❌ слишком короткий token"); _pending.stage = PS_IDLE; return; }
 
-    // Если ПК уже есть — перенастраиваем. Иначе добавляем.
-    // ВАЖНО: в callback бота делаем МИНИМУМ работы. Никаких sendMessage/
-    // никакой сетевой работы — только in-memory правки + один save.
     int idx = pcm.findByName(name);
     bool isNew = (idx < 0);
     if (isNew) {
         idx = pcm.add(name, mac, bc, ip, true, /*autoSave=*/false);
         if (idx < 0) {
-            Serial.println(F("[QR] add fail (limit)"));
-            return true;   // пользователь не получит ответ, но и крэша не будет
+            sendHTML(chatID, "❌ Не удалось добавить (лимит " + String(MAX_PCS) + ")");
+            _pending.stage = PS_IDLE;
+            return;
         }
     } else {
         PC& pc = pcm.at(idx);
@@ -666,25 +745,19 @@ static bool tryHandleQRPayload(fb::Update& u, const String& text) {
         pc.hasIP = true;
     }
     pcm.setAgent(idx, (uint16_t)port, token, /*autoSave=*/false);
-    pcm.save();  // один раз для всех изменений
+    pcm.save();
 
     logAction(userId, String(isNew ? "QR-ADD " : "QR-UPDATE ") + name);
+    Serial.printf("[QR] parsed ok, idx=%d\n", idx);
 
     _pending.stage = PS_SEND_ADDED;
     _pending.idx = idx;
-    _pending.chatID = chatID;
     _pending.name = name;
     _pending.isNew = isNew;
     _pending.nextAt = millis() + 200;
-    Serial.printf("[QR] queued pending for %s\n", name.c_str());
-    return true;
 }
 
 void uiTick() {
-    // В Async-режиме ни в коем случае не отправляем пока tick ждёт
-    // ответ от сервера — иначе FastBot2 переподключит TCP (блок ~1с).
-    if (_bot->isPolling()) return;
-
     // --- Очередь уведомлений (по 1 на тик, с паузой между отправками) ---
     if ((int32_t)(millis() - _notifyNextAt) >= 0) {
         for (int i = 0; i < NOTIFY_QUEUE_SIZE; i++) {
@@ -706,6 +779,11 @@ void uiTick() {
     // --- Pending (QR-добавление) ---
     if (_pending.stage == PS_IDLE) return;
     if ((int32_t)(millis() - _pending.nextAt) < 0) return;
+
+    if (_pending.stage == PS_PARSE) {
+        doParseQR();
+        return;
+    }
 
     if (_pending.stage == PS_SEND_ADDED) {
         Serial.println(F("[UI] pending: send ADDED"));

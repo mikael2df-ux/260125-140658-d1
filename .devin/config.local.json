@@ -10,7 +10,12 @@
       "Exec(wc)",
       "Exec(sleep)",
       "Exec(curl)",
-      "Exec(~/.platformio/penv/Scripts/pio.exe device)"
+      "Exec(~/.platformio/penv/Scripts/pio.exe device)",
+      "Exec(ls)",
+      "Exec(netstat)",
+      "Exec(tasklist)",
+      "Exec(taskkill)",
+      "Exec(findstr)"
     ]
   }
 }

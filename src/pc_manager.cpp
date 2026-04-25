@@ -13,7 +13,8 @@ bool PCManager::load() {
     File f = LittleFS.open(PCS_FILE, "r");
     if (!f) { Serial.println(F("[PCM] open fail")); return false; }
 
-    StaticJsonDocument<2048> doc;
+    // На heap — чтобы не съедать 2KB стека (критично в callback'ах FastBot2).
+    DynamicJsonDocument doc(2048);
     auto err = deserializeJson(doc, f);
     f.close();
     if (err) { Serial.printf("[PCM] JSON err: %s\n", err.c_str()); return false; }
@@ -41,7 +42,7 @@ bool PCManager::load() {
 }
 
 bool PCManager::save() {
-    StaticJsonDocument<2048> doc;
+    DynamicJsonDocument doc(2048);   // heap, не стек
     JsonArray arr = doc.createNestedArray("pcs");
     for (int i = 0; i < _count; i++) {
         JsonObject o = arr.createNestedObject();

@@ -16,6 +16,8 @@ static AgentResult _request(const PC& pc, const char* path, bool post) {
         Serial.printf("[AGT] begin fail: %s\n", url.c_str());
         return r;
     }
+    Serial.printf("[AGT] token='%s' len=%u\n",
+                  pc.agentToken.c_str(), pc.agentToken.length());
     http.addHeader("Authorization", "Bearer " + pc.agentToken);
     http.addHeader("Content-Type", "application/json");
 

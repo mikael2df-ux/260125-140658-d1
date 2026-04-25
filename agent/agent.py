@@ -183,8 +183,17 @@ class Handler(BaseHTTPRequestHandler):
     def _auth_ok(self) -> bool:
         auth = self.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
+            sys.stderr.write(f"[AUTH] no Bearer header, got: {auth!r}\n")
             return False
-        return secrets.compare_digest(auth[7:].strip(), self.cfg["token"])
+        got = auth[7:].strip()
+        expected = self.cfg["token"]
+        ok = secrets.compare_digest(got, expected)
+        if not ok:
+            sys.stderr.write(
+                f"[AUTH FAIL] got len={len(got)} '{got[:8]}...{got[-4:]}' "
+                f"expected len={len(expected)} '{expected[:8]}...{expected[-4:]}'\n"
+            )
+        return ok
 
     def _reply(self, code: int, body: dict | str):
         data = body if isinstance(body, (bytes, str)) else json.dumps(body)
@@ -209,25 +218,43 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def do_GET(self):
-        if self.path in ("/", "/health"):
-            return self._reply(200, {"ok": True})
-        if self.path == "/status":
-            if not self._auth_ok():
-                return self._reply(401, {"error": "unauthorized"})
-            return self._reply(200, self._status_payload())
-        return self._reply(404, {"error": "not found"})
+        try:
+            sys.stderr.write(f"[REQ] GET {self.path}\n")
+            if self.path in ("/", "/health"):
+                return self._reply(200, {"ok": True})
+            if self.path == "/status":
+                if not self._auth_ok():
+                    return self._reply(401, {"error": "unauthorized"})
+                return self._reply(200, self._status_payload())
+            return self._reply(404, {"error": "not found"})
+        except Exception as e:
+            import traceback
+            sys.stderr.write("[ERROR do_GET]\n" + traceback.format_exc())
+            try:
+                self._reply(500, {"error": str(e)})
+            except Exception:
+                pass
 
     def do_POST(self):
-        if not self._auth_ok():
-            return self._reply(401, {"error": "unauthorized"})
-        action = self.path.lstrip("/")
-        if action not in ACTIONS:
-            return self._reply(404, {"error": f"unknown action '{action}'"})
         try:
-            ACTIONS[action]()
+            sys.stderr.write(f"[REQ] POST {self.path}\n")
+            if not self._auth_ok():
+                return self._reply(401, {"error": "unauthorized"})
+            action = self.path.lstrip("/")
+            if action not in ACTIONS:
+                return self._reply(404, {"error": f"unknown action '{action}'"})
+            try:
+                ACTIONS[action]()
+            except Exception as e:
+                return self._reply(500, {"error": str(e)})
+            return self._reply(200, {"ok": True, "action": action})
         except Exception as e:
-            return self._reply(500, {"error": str(e)})
-        return self._reply(200, {"ok": True, "action": action})
+            import traceback
+            sys.stderr.write("[ERROR do_POST]\n" + traceback.format_exc())
+            try:
+                self._reply(500, {"error": str(e)})
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -349,13 +376,61 @@ def run_server():
 
 # ---------------------------------------------------------------------------
 
+def show_config():
+    if not CONFIG_PATH.exists():
+        print(f"[!] Нет файла {CONFIG_PATH}. Запусти: python agent.py --setup")
+        return
+    cfg = json.loads(CONFIG_PATH.read_text())
+    print("=" * 60)
+    print(" Текущая конфигурация agent.json:")
+    print("=" * 60)
+    for k, v in cfg.items():
+        print(f"  {k:10s} = {v}")
+    print("=" * 60)
+    token = cfg.get("token", "")
+    port  = cfg.get("port", DEFAULT_PORT)
+    print("\nТест авторизации (должен вернуть 200 + JSON):")
+    print(f'  curl -i -H "Authorization: Bearer {token}" http://localhost:{port}/status')
+
+
+def regen_qr():
+    """Перегенерировать QR из текущего agent.json (без смены токена)."""
+    if not CONFIG_PATH.exists():
+        print(f"[!] Нет файла {CONFIG_PATH}. Запусти: python agent.py --setup")
+        return
+    cfg = json.loads(CONFIG_PATH.read_text())
+    payload = (f"WOLBOT|v1|{cfg['name']}|{cfg['mac']}|{cfg['bcast']}|"
+               f"{cfg['ip']}|{cfg['port']}|{cfg['token']}")
+    print("=" * 60)
+    print(" QR из текущего agent.json (токен НЕ меняется):")
+    print("=" * 60)
+    print(f"  name:  {cfg['name']}")
+    print(f"  ip:    {cfg['ip']}")
+    print(f"  port:  {cfg['port']}")
+    print(f"  token: {cfg['token']}")
+    print()
+    png = qr_ascii(payload)
+    print("\nТекстовый пейлоад (можно просто переслать боту):\n")
+    print("  " + payload)
+    if png:
+        print(f"\n[+] PNG сохранён: {png}")
+    print("\nОтправь этот QR (или текст) боту — он обновит ПК правильным токеном.")
+
+
 def main():
     ap = argparse.ArgumentParser(description="WOL-Bot PC Agent")
-    ap.add_argument("--setup", action="store_true", help="interactive setup + QR")
+    ap.add_argument("--setup",    action="store_true", help="новый setup (перезапишет токен!)")
+    ap.add_argument("--show",     action="store_true", help="показать текущий agent.json")
+    ap.add_argument("--regen-qr", action="store_true",
+                    help="перегенерировать QR из текущего agent.json (токен не меняется)")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT,
                     help=f"HTTP port (default {DEFAULT_PORT})")
     args = ap.parse_args()
-    if args.setup:
+    if args.show:
+        show_config()
+    elif getattr(args, "regen_qr"):
+        regen_qr()
+    elif args.setup:
         setup_interactive(args.port)
     else:
         run_server()

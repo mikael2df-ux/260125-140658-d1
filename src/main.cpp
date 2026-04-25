@@ -31,13 +31,21 @@ static uint32_t _startedAt = 0;
 // Update dispatcher
 // =============================================================
 static void onUpdate(fb::Update& u) {
+    Serial.printf("[UPD] type=%d isQ=%d isM=%d free=%d\n",
+                  (int)u.type(), (int)u.isQuery(), (int)u.isMessage(),
+                  (int)ESP.getFreeHeap());
+
     // Игнорируем апдейты первые N мс после старта (вдруг накопились)
-    if (millis() - _startedAt < BOT_STARTUP_DELAY_MS) return;
+    if (millis() - _startedAt < BOT_STARTUP_DELAY_MS) {
+        Serial.println(F("[UPD] dropped (startup delay)"));
+        return;
+    }
 
     // Определяем id отправителя
     int64_t fromId = u.isQuery()
         ? (int64_t)u.query().from().id()
         : (int64_t)u.message().from().id();
+    Serial.printf("[UPD] from %lld\n", (long long)fromId);
 
     if (!isAdmin(fromId)) {
         Serial.printf("[BOT] DENY from %lld\n", (long long)fromId);
@@ -60,9 +68,15 @@ static void onUpdate(fb::Update& u) {
     }
 
     if (u.isQuery()) {
+        Serial.printf("[UPD] -> query data='%s'\n",
+                      String(u.query().data()).c_str());
         uiHandleQuery(u);
+        Serial.println(F("[UPD] query done"));
     } else if (u.isMessage()) {
+        Serial.printf("[UPD] -> msg text='%s'\n",
+                      String(u.message().text()).c_str());
         uiHandleMessage(u);
+        Serial.println(F("[UPD] msg done"));
     }
 }
 
@@ -118,11 +132,12 @@ void setup() {
     // Bot
     bot.setToken(F(BOT_TOKEN));
     bot.skipUpdates();                              // пропустить накопленные
-    // ВАЖНО: Async — callback в user ctx (как Sync), НО tick() не
-    // блокируется на ожидании ответа, а возвращается быстро. Это даёт
-    // loop() нормальную частоту и позволяет избегать WDT.
-    // Перед отправкой сообщения из uiTick() проверяем bot.isPolling().
-    bot.setPollMode(fb::Poll::Async, 4000);
+    // ВАЖНО:
+    //  - Long  — callback из async TCP handler (ctx: sys) → реентрант TCP → Exception(2)
+    //  - Async — callback тоже из sys ctx → panic на yield() после callback
+    //  - Sync  — единственный безопасный: callback гарантированно в user ctx (из tick).
+    //    Платим блокировкой tick() на время ответа telegram, но это нормально.
+    bot.setPollMode(fb::Poll::Sync, 3500);
     bot.attachUpdate(onUpdate);
 
     // UI & Monitor
@@ -140,6 +155,18 @@ void setup() {
 }
 
 void loop() {
+    static uint32_t _lastBeat = 0;
+    static uint32_t _nLoops = 0;
+    _nLoops++;
+    // "сердцебиение" каждую секунду — чтобы видеть что loop жив
+    if (millis() - _lastBeat > 1000) {
+        _lastBeat = millis();
+        Serial.printf("[HB] loops=%lu heap=%u polling=%d\n",
+                      (unsigned long)_nLoops, ESP.getFreeHeap(),
+                      (int)bot.isPolling());
+        _nLoops = 0;
+    }
+
     bot.tick();
     yield();
     uiTick();
